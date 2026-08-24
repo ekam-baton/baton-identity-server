@@ -1,0 +1,72 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Organic Codebase Visualizer</title>
+        <style>
+            body { margin: 0; overflow: hidden; background-color: #0f172a; color: white; font-family: 'Inter', sans-serif; }
+            #graph { width: 100vw; height: 100vh; }
+            .tooltip {
+                position: absolute;
+                padding: 8px 12px;
+                background: rgba(15, 23, 42, 0.9);
+                border: 1px solid #334155;
+                border-radius: 6px;
+                color: #e2e8f0;
+                font-size: 14px;
+                pointer-events: none;
+                opacity: 0;
+                transition: opacity 0.2s;
+            }
+        </style>
+        <script src="https://unpkg.com/force-graph"></script>
+    </head>
+    <body>
+        <div id="graph"></div>
+        <script>
+            const data = {"nodes": [{"id": 0, "name": "baton-identity-server", "type": "directory", "val": 5}, {"id": 1, "name": "migrations", "type": "directory", "val": 5}, {"id": 2, "name": "nginx", "type": "directory", "val": 5}, {"id": 3, "name": "src", "type": "directory", "val": 5}, {"id": 4, "name": "Cargo.lock", "type": "file", "val": 2}, {"id": 5, "name": "Cargo.toml", "type": "file", "val": 2}, {"id": 6, "name": "docker-compose.yml", "type": "file", "val": 2}, {"id": 7, "name": "Dockerfile", "type": "file", "val": 2}, {"id": 8, "name": "visualize.py", "type": "file", "val": 2}, {"id": 9, "name": "20260726_create_users.sql", "type": "file", "val": 2}, {"id": 10, "name": "2026072702_add_is_revoked.sql", "type": "file", "val": 2}, {"id": 11, "name": "2026072703_add_lockout.sql", "type": "file", "val": 2}, {"id": 12, "name": "20260727_add_email_verification.sql", "type": "file", "val": 2}, {"id": 13, "name": "20260727_add_refresh_tokens.sql", "type": "file", "val": 2}, {"id": 14, "name": "20260727_add_subscription_status.sql", "type": "file", "val": 2}, {"id": 15, "name": "default.conf", "type": "file", "val": 2}, {"id": 16, "name": "auth.rs", "type": "file", "val": 2}, {"id": 17, "name": "db.rs", "type": "file", "val": 2}, {"id": 18, "name": "email.rs", "type": "file", "val": 2}, {"id": 19, "name": "main.rs", "type": "file", "val": 2}, {"id": 20, "name": "models.rs", "type": "file", "val": 2}], "links": [{"source": 0, "target": 1}, {"source": 0, "target": 2}, {"source": 0, "target": 3}, {"source": 0, "target": 4}, {"source": 0, "target": 5}, {"source": 0, "target": 6}, {"source": 0, "target": 7}, {"source": 0, "target": 8}, {"source": 1, "target": 9}, {"source": 1, "target": 10}, {"source": 1, "target": 11}, {"source": 1, "target": 12}, {"source": 1, "target": 13}, {"source": 1, "target": 14}, {"source": 2, "target": 15}, {"source": 3, "target": 16}, {"source": 3, "target": 17}, {"source": 3, "target": 18}, {"source": 3, "target": 19}, {"source": 3, "target": 20}]};
+            
+            const elem = document.getElementById('graph');
+            const Graph = ForceGraph()(elem)
+                .graphData(data)
+                .nodeLabel('name')
+                .nodeAutoColorBy('type')
+                .nodeVal('val')
+                .linkDirectionalParticles(2)
+                .linkDirectionalParticleSpeed(d => 0.005)
+                .linkColor(() => '#334155')
+                .backgroundColor('#0f172a')
+                .onNodeClick(node => {
+                    // Center/zoom on node
+                    Graph.centerAt(node.x, node.y, 1000);
+                    Graph.zoom(8, 2000);
+                });
+                
+            // Custom node rendering to make it organic
+            Graph.nodeCanvasObject((node, ctx, globalScale) => {
+                const label = node.name;
+                const fontSize = 12/globalScale;
+                ctx.font = `${fontSize}px Sans-Serif`;
+                const textWidth = ctx.measureText(label).width;
+                const bckgDimensions = [textWidth, fontSize].map(n => n + fontSize * 0.2); 
+
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.8)';
+                ctx.fillRect(node.x - bckgDimensions[0] / 2, node.y - bckgDimensions[1] / 2, ...bckgDimensions);
+
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillStyle = node.type === 'directory' ? '#38bdf8' : '#a78bfa';
+                
+                // Draw circle
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, node.type === 'directory' ? 6 : 3, 0, 2 * Math.PI, false);
+                ctx.fill();
+                
+                // Draw text below
+                ctx.fillStyle = '#e2e8f0';
+                ctx.fillText(label, node.x, node.y + 8);
+            });
+        </script>
+    </body>
+    </html>
+    

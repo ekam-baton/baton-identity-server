@@ -1,0 +1,9 @@
+ALTER TABLE users
+ADD COLUMN is_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE TABLE verification_codes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code VARCHAR(6) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+);

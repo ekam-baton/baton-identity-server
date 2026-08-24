@@ -8,7 +8,7 @@ pub async fn get_db_pool() -> Result<PgPool, sqlx::Error> {
         .unwrap_or_else(|_| "postgres://postgres:password@localhost:5432/baton_identity".to_string());
 
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(50)
         .connect(&database_url)
         .await?;
 
