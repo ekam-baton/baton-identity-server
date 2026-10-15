@@ -84,3 +84,39 @@ impl FromRequestParts<std::sync::Arc<crate::AppState>> for AuthenticatedUser {
         Ok(AuthenticatedUser { id: token_data.claims.sub })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_password_hashing_and_verification() {
+        let password = "SuperSecretSecurePassword2026!";
+        let hash = hash_password(password).expect("Hashing failed");
+        assert!(verify_password(password, &hash));
+        assert!(!verify_password("WrongPassword!", &hash));
+    }
+
+    #[test]
+    fn test_jwt_generation_and_decode() {
+        let user_id = Uuid::new_v4();
+        let secret = "test-jwt-secret-key-32-bytes-long!";
+        let token = generate_jwt(user_id, secret).expect("Token generation failed");
+
+        let token_data = jsonwebtoken::decode::<Claims>(
+            &token,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &jsonwebtoken::Validation::default(),
+        ).expect("Token decode failed");
+
+        assert_eq!(token_data.claims.sub, user_id);
+    }
+
+    #[test]
+    fn test_refresh_token_generation() {
+        let token1 = generate_refresh_token();
+        let token2 = generate_refresh_token();
+        assert_eq!(token1.len(), 64);
+        assert_ne!(token1, token2);
+    }
+}

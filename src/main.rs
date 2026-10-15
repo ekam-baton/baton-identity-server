@@ -34,19 +34,17 @@ fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<Socket
     let is_trusted = remote_ip.map(|ip| trusted_proxies.contains(&ip)).unwrap_or(false);
 
     if is_trusted {
-        if let Some(xff) = headers.get("x-forwarded-for") {
-            if let Ok(val) = xff.to_str() {
+        if let Some(xff) = headers.get("x-forwarded-for")
+            && let Ok(val) = xff.to_str() {
                 let ips: Vec<&str> = val.split(',').collect();
                 if let Some(first) = ips.first() {
                     return first.trim().to_string();
                 }
             }
-        }
-        if let Some(xri) = headers.get("x-real-ip") {
-            if let Ok(val) = xri.to_str() {
+        if let Some(xri) = headers.get("x-real-ip")
+            && let Ok(val) = xri.to_str() {
                 return val.trim().to_string();
             }
-        }
     }
 
     remote_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
@@ -247,14 +245,13 @@ async fn login(
 
     if let Some(user) = user {
         // Check if account is locked
-        if let Some(lockout_time) = user.lockout_until {
-            if lockout_time > chrono::Utc::now() {
+        if let Some(lockout_time) = user.lockout_until
+            && lockout_time > chrono::Utc::now() {
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(ErrorResponse { error: "Account locked due to too many failed attempts. Try again later.".into() }),
                 ));
             }
-        }
 
         if !user.is_verified {
             return Err((
@@ -387,11 +384,10 @@ async fn recover(
         )
     })?;
 
-    if let Some(user) = user {
-        if auth::verify_password(&payload.password, &user.password_hash) {
+    if let Some(user) = user
+        && auth::verify_password(&payload.password, &user.password_hash) {
             return Ok(Json(RecoverResponse { encrypted_key_backup: user.encrypted_key_backup }));
         }
-    }
 
     Err((
         StatusCode::UNAUTHORIZED,
@@ -523,7 +519,7 @@ async fn reset_password(
 }
 
 async fn verify_google_play(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     axum::extract::Json(payload): axum::extract::Json<models::VerifyPlayRequest>,
 ) -> impl axum::response::IntoResponse {
 
@@ -568,9 +564,12 @@ async fn verify_google_play(
     }
 }
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct VerificationCodeRow {
+    #[allow(dead_code)]
     id: Uuid,
+    #[allow(dead_code)]
     code: String,
     expires_at: chrono::DateTime<chrono::Utc>,
 }
