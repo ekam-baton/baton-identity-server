@@ -8,10 +8,7 @@ pub async fn send_verification_email(to_email: &str, otp: &str) -> Result<(), Bo
     let smtp_password = env::var("SMTP_PASSWORD").unwrap_or_else(|_| "mock_password".to_string());
 
     // Using unencrypted for mock/testing if mock password, else real SMTP
-    if smtp_password == "mock_password" {
-        println!("MOCK EMAIL SENT to {}: {}", to_email, otp);
-        return Ok(());
-    }
+    
 
     let email = Message::builder()
         .from(format!("Baton Security <{}>", smtp_username).parse()?)

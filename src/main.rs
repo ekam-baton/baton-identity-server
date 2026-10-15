@@ -4,7 +4,7 @@ mod models;
 mod email;
 
 use axum::{
-    extract::State,
+    extract::{State, ConnectInfo},
     http::StatusCode,
     routing::{post, get},
     Json, Router,
@@ -18,33 +18,27 @@ use tower_http::cors::{Any, CorsLayer, AllowOrigin};
 use axum::http::Method;
 
 use dashmap::DashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Instant, Duration};
 
-fn extract_client_ip(addr: &std::net::SocketAddr, headers: &axum::http::HeaderMap) -> String {
-    let socket_ip = addr.ip();
-    let is_trusted_proxy = socket_ip.is_loopback() || match socket_ip {
-        IpAddr::V4(ipv4) => ipv4.is_private(),
-        IpAddr::V6(_) => false,
-    };
+fn extract_client_ip(headers: &axum::http::HeaderMap, remote_addr: Option<SocketAddr>) -> String {
+    let remote_ip = remote_addr.map(|a| a.ip());
+    
+    // HI-1 FIX: Only trust forwarded headers from known proxy IPs
+    let trusted_proxies: Vec<IpAddr> = std::env::var("TRUSTED_PROXY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+        .collect();
 
-    if is_trusted_proxy {
+    let is_trusted = remote_ip.map(|ip| trusted_proxies.contains(&ip)).unwrap_or(false);
+
+    if is_trusted {
         if let Some(xff) = headers.get("x-forwarded-for") {
             if let Ok(val) = xff.to_str() {
                 let ips: Vec<&str> = val.split(',').collect();
-                for ip_str in ips.iter().rev() {
-                    if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                        let is_internal = ip.is_loopback() || match ip {
-                            IpAddr::V4(ipv4) => ipv4.is_private(),
-                            IpAddr::V6(_) => false,
-                        };
-                        if !is_internal {
-                            return ip.to_string();
-                        }
-                    }
-                }
-                if let Some(last) = ips.last() {
-                    return last.trim().to_string();
+                if let Some(first) = ips.first() {
+                    return first.trim().to_string();
                 }
             }
         }
@@ -54,11 +48,12 @@ fn extract_client_ip(addr: &std::net::SocketAddr, headers: &axum::http::HeaderMa
             }
         }
     }
-    socket_ip.to_string()
+
+    remote_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
 }
 
 
-struct AppState {
+pub(crate) struct AppState {
     db: PgPool,
     jwt_secret: String,
     rate_limits: DashMap<String, Vec<Instant>>,
@@ -69,9 +64,13 @@ async fn main() {
     dotenvy::dotenv().ok();
     
     let db = db::get_db_pool().await.expect("Failed to connect to database");
-    let jwt_secret = env::var("JWT_SECRET").expect(
-        "FATAL: JWT_SECRET environment variable is not set. Generate one with: openssl rand -hex 32"
-    );
+    let jwt_secret = match env::var("JWT_SECRET") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("FATAL: JWT_SECRET environment variable is not set. Generate one with: openssl rand -hex 32");
+            std::process::exit(1);
+        }
+    };
 
     let state = Arc::new(AppState { 
         db, 
@@ -97,32 +96,34 @@ async fn main() {
         .route("/keys/{client_id}", get(get_keys))
         .route("/backups/upload", post(upload_backup))
         .route("/backups/download", get(download_backup))
-        .layer(
+        .route("/health", get(|| async { Json(serde_json::json!({"status":"ok","service":"identity-server"})) }))
+        .layer({
+            let origins: Vec<axum::http::HeaderValue> = std::env::var("CORS_ORIGINS")
+                .unwrap_or_else(|_| "https://baton.network,tauri://localhost,http://localhost:5173".to_string())
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
             CorsLayer::new()
-                .allow_origin(AllowOrigin::list([
-                    "https://baton.network".parse().unwrap(),
-                    "tauri://localhost".parse().unwrap(),
-                    "http://localhost:5173".parse().unwrap(),
-                ]))
+                .allow_origin(AllowOrigin::list(origins))
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-                .allow_headers(Any),
-        )
+                .allow_headers(Any)
+        })
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
     println!("Identity Server running on port 3001");
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 
 async fn register(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
     
     // Anti-Bot Spam Rate Limiting: Max 3 registrations per IP per hour
-    let ip = extract_client_ip(&addr, &headers);
+    let ip = extract_client_ip(&headers, Some(addr));
     let now = Instant::now();
     let window = Duration::from_secs(3600);
     
@@ -174,7 +175,7 @@ async fn register(
                 .bind(chrono::Utc::now())
                 .execute(&state.db)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
             
             let _ = sqlx::query("INSERT INTO verification_codes (user_id, code, expires_at) VALUES ($1, $2, $3)")
                 .bind(user_id)
@@ -183,7 +184,7 @@ async fn register(
                 .execute(&state.db)
                 .await.map_err(|e| { eprintln!("DB error: {}", e); (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Internal server error".into() })) })?;
             
-            let _ = email::send_verification_email(&payload.email, &otp).await;
+            email::send_verification_email(&payload.email, &otp).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
             
             let token = auth::generate_jwt(user_id, &state.jwt_secret).map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Token generation failed".into() })))?;
             let refresh_token = auth::generate_refresh_token();
@@ -208,14 +209,14 @@ async fn register(
 }
 
 async fn login(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ErrorResponse>)> {
     
     // Rate Limiting Logic: Max 5 requests per 5 minutes per IP
-    let ip = extract_client_ip(&addr, &headers);
+    let ip = extract_client_ip(&headers, Some(addr));
     let now = Instant::now();
     let window = Duration::from_secs(300);
     
@@ -269,14 +270,14 @@ async fn login(
                 .bind(user.id)
                 .execute(&state.db)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
 
             // MINIMIZATION LOGIC: Self-Cleaning DB to destroy expired metadata
             sqlx::query("DELETE FROM refresh_tokens WHERE expires_at < $1")
                 .bind(chrono::Utc::now())
                 .execute(&state.db)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
             
             // DEVICE LIMIT LOGIC
             if user.subscription_status != "premium" {
@@ -299,7 +300,7 @@ async fn login(
                     .bind(chrono::Utc::now())
                     .execute(&state.db)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
                 }
             }
 
@@ -332,14 +333,14 @@ async fn login(
                     .bind(user.id)
                     .execute(&state.db)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
             } else {
                 sqlx::query("UPDATE users SET failed_login_attempts = $1 WHERE id = $2")
                     .bind(new_attempts)
                     .bind(user.id)
                     .execute(&state.db)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
             }
         }
     }
@@ -351,13 +352,13 @@ async fn login(
 }
 
 async fn recover(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<LoginRequest>,
 ) -> Result<Json<RecoverResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Rate Limiting Logic: Max 5 requests per 5 minutes per IP
-    let ip = extract_client_ip(&addr, &headers);
+    let ip = extract_client_ip(&headers, Some(addr));
     let now = Instant::now();
     let window = Duration::from_secs(300);
     
@@ -404,9 +405,28 @@ struct ForgotPasswordRequest {
 }
 
 async fn forgot_password(
+    headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ForgotPasswordRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // HI-5 FIX: Rate limit password reset requests (3 per IP per hour)
+    let ip = format!("forgot_{}", extract_client_ip(&headers, Some(addr)));
+    let now = Instant::now();
+    let window = Duration::from_secs(3600);
+    
+    let mut attempts = state.rate_limits.entry(ip).or_insert_with(Vec::new);
+    attempts.retain(|&t| now.duration_since(t) < window);
+    
+    if attempts.len() >= 3 {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse { error: "Too many password reset attempts. Please try again later.".into() }),
+        ));
+    }
+    attempts.push(now);
+    drop(attempts);
+
     let user = sqlx::query_as::<_, User>(
         "SELECT id, email, phone_number, password_hash, encrypted_key_backup, created_at, subscription_status, subscription_expiry, is_verified, failed_login_attempts, lockout_until FROM users WHERE email = $1"
     )
@@ -429,7 +449,7 @@ async fn forgot_password(
             .execute(&state.db)
             .await;
         
-        let _ = email::send_verification_email(&payload.email, &otp).await;
+        email::send_verification_email(&payload.email, &otp).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
     }
 
     Ok(Json(serde_json::json!({ "message": "If that email exists, a reset code was sent" })))
@@ -484,13 +504,13 @@ async fn reset_password(
                     .bind(user.id)
                     .execute(&state.db)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
                     
                 sqlx::query("DELETE FROM refresh_tokens WHERE user_id = $1")
                     .bind(user.id)
                     .execute(&state.db)
                     .await
-                    .unwrap_or_default();
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
 
                 return Ok(Json(serde_json::json!({ "message": "Password reset successful" })));
             } else {
@@ -506,20 +526,8 @@ async fn verify_google_play(
     State(state): State<Arc<AppState>>,
     axum::extract::Json(payload): axum::extract::Json<models::VerifyPlayRequest>,
 ) -> impl axum::response::IntoResponse {
-    let is_mock = env::var("GOOGLE_PLAY_MOCK_VERIFY").unwrap_or_else(|_| "false".to_string());
-    if is_mock == "true" {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "valid": true,
-                "status": "mock_verified"
-            }))
-        );
-    }
 
-    // Sketching out reqwest structure for Google Play verification
-    // To complete this, we need a valid Google Service Account token
-    /*
+
     let client = reqwest::Client::new();
     let app_package = "com.ekam.baton";
     let url = format!(
@@ -527,20 +535,37 @@ async fn verify_google_play(
         app_package, payload.product_id, payload.purchase_token
     );
     let google_token = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").unwrap_or_default();
-    let res = client.get(&url)
+    let res = match client.get(&url)
         .bearer_auth(google_token)
         .send()
-        .await;
-    */
+        .await {
+        Ok(r) => r,
+        Err(_) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Failed to contact Google Play API",
+                "valid": false
+            }))
+        ),
+    };
 
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "Google Play verification is not yet configured. Contact support.",
-            "status": "not_implemented",
-            "valid": false
-        }))
-    )
+    if res.status().is_success() {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "valid": true,
+                "status": "verified"
+            }))
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid purchase token",
+                "valid": false
+            }))
+        )
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -551,14 +576,14 @@ struct VerificationCodeRow {
 }
 
 async fn verify_email(
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<models::VerifyEmailRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     
     // Rate Limiting Logic: Max 5 requests per 5 minutes per IP
-    let ip = extract_client_ip(&addr, &headers);
+    let ip = extract_client_ip(&headers, Some(addr));
     let now = Instant::now();
     let window = Duration::from_secs(300);
     
